@@ -25,7 +25,7 @@ You just plug in the full script, install dependencies, and blaze.
    python dft_visualizer.py --file examples/my_track.wav
    ```
 
-## Features (once full script is added)
+## Features
 - Real-time FFT spectrum (log frequency, dB magnitude)
 - Scrolling spectrogram
 - Works with mic or file input
