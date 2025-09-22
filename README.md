@@ -15,7 +15,7 @@ You just plug in the full script, install dependencies, and blaze.
    pip install -r requirements.txt
    ```
 
-3. Replace `dft_visualizer.py` placeholder with the full script provided by ChatGPT.
+3. Prepare your audio source.
 
 4. Run with microphone input:
    ```bash
