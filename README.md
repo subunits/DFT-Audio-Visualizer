@@ -5,9 +5,8 @@ You just plug in the full script, install dependencies, and blaze.
 
 ## Quickstart
 
-1. Unzip the project:
+1. Navigate:
    ```bash
-   unzip dft_visualizer.zip
    cd dft_visualizer
    ```
 
