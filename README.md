@@ -16,7 +16,7 @@ You just plug in the full script, install dependencies, and blaze.
    ```
 
 3. Prepare your audio source:
-   # Only uncompressed PCM encoded wave files are supported
+   - Only uncompressed PCM encoded wave files are supported
 
 5. Run with microphone input:
    ```bash
