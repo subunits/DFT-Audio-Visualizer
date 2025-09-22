@@ -15,15 +15,12 @@ You just plug in the full script, install dependencies, and blaze.
    pip install -r requirements.txt
    ```
 
-3. Prepare your audio source:
-   - Only uncompressed PCM encoded wave files are supported
-
-5. Run with microphone input:
+3. Run with microphone input:
    ```bash
    python dft_visualizer.py --device live
    ```
 
-6. Or run with an audio file:
+4. Or run with an audio file:
    ```bash
    python dft_visualizer.py --file examples/my_track.wav
    ```
