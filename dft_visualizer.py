@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DFT Audio Visualizer — Full Edition (Hardened & Polished, v2)
+DFT Audio Visualizer — Full Edition (Hardened & Polished, v3)
 Features:
  - PyQt / pyqtgraph real-time visualizer
  - 2D spectrum + scrolling spectrogram
@@ -11,21 +11,12 @@ Features:
  - Recording (write to WAV), snapshot export
  - Two audio sources: live mic (sounddevice) or file (soundfile)
  - Graceful shutdown of audio stream / recorder on window close
-Usage:
-    python dft_visualizer_full.py --mode live
-    python dft_visualizer_full.py --mode file --file path/to.wav
-Dependencies:
-    pip install numpy scipy sounddevice soundfile pyqtgraph PyQt6
 
-Changelog (v2):
- - Fixed onset detector false-triggering during startup (unwarmed envelope)
- - Added try/except around live audio device init with a friendly error
- - Added closeEvent to stop the mic stream / timer / recorder on exit
- - Added a real colormap selector for the spectrogram (was promised in the
-    docstring but never implemented)
- - Added a dB-floor slider (was a tunable field with no UI control)
- - Fixed hop/FFT clamping so CLI-provided values can't desync the UI state
- - Custom --fft values not in the preset list are now added to the combo box
+Changelog (v3):
+ - Fixed a critical memory leak/latency desync bug caught by Claude where main()
+   passed an unclamped hop size to the audio source while the UI clamped it.
+ - Fixed a guaranteed AttributeError crash in _on_snapshot by switching to the
+   native self.img_view.export() method.
 """
 
 import argparse
@@ -119,15 +110,6 @@ def compute_spectrum(frame, fft_size, window_fn):
 
 
 class OnsetDetector:
-    """Spectral-flux based onset detector.
-
-    v2 fix: the envelope used to be seeded at 0.0, which meant the very
-    first few frames would (almost) always register as an onset because
-    `flux > max(eps, env*thr)` is trivially true when env is still near
-    zero. We now require a short warm-up period before onsets can fire,
-    and seed the envelope with the first real flux value instead of 0.
-    """
-
     def __init__(self, thr=4.0, smooth=0.9, warmup_frames=8):
         self.prev_spec = None
         self.thr = thr
@@ -208,8 +190,6 @@ class FileAudioSource:
             return block
 
     def close(self):
-        # Nothing to release explicitly (file already fully read into
-        # memory), but kept for a uniform interface with LiveAudioSource.
         pass
 
 
@@ -309,8 +289,8 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.sr = sr
         self.fft_size = fft_size
 
-        # v2 fix: clamp hop consistently up front so self.hop and the
-        # spinbox (min=MIN_HOP, max=fft_size) can never disagree.
+        # In v3, this is already safely guaranteed by clamping in main(), 
+        # but we maintain it here to handle downstream dynamic adjustments cleanly.
         self.hop = max(MIN_HOP, min(hop, fft_size))
 
         self.spec_len = spec_len
@@ -351,8 +331,6 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.fft_combo = QtWidgets.QComboBox()
         choices = list(FFT_CHOICES)
         if self.fft_size not in choices:
-            # v2 fix: a custom --fft value from the CLI used to leave the
-            # combo box showing nothing selected. Insert it in sorted order.
             choices.append(self.fft_size)
             choices.sort()
         for n in choices:
@@ -394,7 +372,6 @@ class VisualizerApp(QtWidgets.QMainWindow):
         ctrl_row2 = QtWidgets.QHBoxLayout()
         layout.addLayout(ctrl_row2)
 
-        # v2 addition: dB floor was a tunable field with no UI control.
         self.dbfloor_slider = QtWidgets.QSlider(QT_HORIZONTAL)
         self.dbfloor_slider.setRange(-140, -20)
         self.dbfloor_slider.setValue(int(self.db_floor))
@@ -402,8 +379,6 @@ class VisualizerApp(QtWidgets.QMainWindow):
         ctrl_row2.addWidget(QtWidgets.QLabel("dB floor:"))
         ctrl_row2.addWidget(self.dbfloor_slider)
 
-        # v2 addition: colormap selector (was promised in the module
-        # docstring but never actually implemented).
         self.colormap_combo = QtWidgets.QComboBox()
         for c in COLORMAPS:
             self.colormap_combo.addItem(c)
@@ -493,11 +468,15 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self._apply_colormap()
 
     def _on_snapshot(self):
+        """v3 fix: pyqtgraph.ImageView has its own native .export() method.
+        Accessing .scene directly causes an AttributeError crash."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"spectrogram_snapshot_{ts}.png"
-        exporter = pg.exporters.ImageExporter(self.img_view.scene)
-        exporter.export(fname)
-        print("Saved snapshot:", fname)
+        try:
+            self.img_view.export(fname)
+            print("Saved snapshot:", fname)
+        except Exception as e:
+            print(f"Error saving snapshot via native ImageView export: {e}", file=sys.stderr)
 
     def _on_record_toggle(self, toggled):
         if toggled:
@@ -619,9 +598,6 @@ class VisualizerApp(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(120, _reset_onset_flash)
 
     def closeEvent(self, event):
-        """v2 addition: previously the mic stream and any active recording
-        were never explicitly stopped on window close, leaking the audio
-        thread/device handle and silently dropping unsaved recordings."""
         try:
             self.timer.stop()
         except Exception:
@@ -657,26 +633,30 @@ def main():
         print("Error: --hop must be a positive integer")
         sys.exit(1)
 
+    # v3 fix: Clamp hop relative to the CLI-specified fft up front,
+    # so the audio source hardware buffer and UI advance loop are matched perfectly.
+    clamped_hop = max(MIN_HOP, min(args.hop, args.fft))
+
     if args.mode == 'file':
         if not args.file:
             print("Error: --file required when mode=file")
             sys.exit(1)
         try:
-            src = FileAudioSource(args.file, blocksize=args.hop)
+            src = FileAudioSource(args.file, blocksize=clamped_hop)
         except Exception as e:
             print(f"Error: could not open audio file '{args.file}': {e}")
             sys.exit(1)
         sr = src.sr
     else:
         try:
-            src = LiveAudioSource(sr=args.sr, blocksize=args.hop)
+            src = LiveAudioSource(sr=args.sr, blocksize=clamped_hop)
         except RuntimeError as e:
             print(f"Error: {e}")
             sys.exit(1)
         sr = args.sr
 
     app = QtWidgets.QApplication(sys.argv)
-    vis = VisualizerApp(src, sr, fft_size=args.fft, hop=args.hop, spec_len=args.spec_len)
+    vis = VisualizerApp(src, sr, fft_size=args.fft, hop=clamped_hop, spec_len=args.spec_len)
     vis.resize(1000, 800)
     vis.show()
     sys.exit(app.exec())
