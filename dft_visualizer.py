@@ -316,4 +316,264 @@ class VisualizerApp(QtWidgets.QMainWindow):
         for w in WINDOWS.keys():
             self.window_combo.addItem(w)
         self.window_combo.setCurrentText(self.window_name)
-        self.window_combo.currentTextChanged.connect(self._on
+        self.window_combo.currentTextChanged.connect(self._on_window_change)
+        ctrl_row.addWidget(QtWidgets.QLabel("Window:"))
+        ctrl_row.addWidget(self.window_combo)
+
+        # smoothing
+        self.smooth_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.smooth_slider.setRange(0, 99)
+        self.smooth_slider.setValue(int(self.smooth_alpha*99))
+        self.smooth_slider.valueChanged.connect(self._on_smooth_change)
+        ctrl_row.addWidget(QtWidgets.QLabel("Smoothing:"))
+        ctrl_row.addWidget(self.smooth_slider)
+
+        # gain
+        self.gain_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.gain_slider.setRange(1, 400)
+        self.gain_slider.setValue(int(self.gain*100))
+        self.gain_slider.valueChanged.connect(self._on_gain_change)
+        ctrl_row.addWidget(QtWidgets.QLabel("Gain:"))
+        ctrl_row.addWidget(self.gain_slider)
+
+        # buttons: snapshot, record, presets
+        btn_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(btn_row)
+        self.btn_snapshot = QtWidgets.QPushButton("Snapshot")
+        self.btn_snapshot.clicked.connect(self._on_snapshot)
+        btn_row.addWidget(self.btn_snapshot)
+
+        self.btn_record = QtWidgets.QPushButton("Record")
+        self.btn_record.setCheckable(True)
+        self.btn_record.toggled.connect(self._on_record_toggle)
+        btn_row.addWidget(self.btn_record)
+
+        self.btn_save_preset = QtWidgets.QPushButton("Save Preset")
+        self.btn_save_preset.clicked.connect(self._on_save_preset)
+        btn_row.addWidget(self.btn_save_preset)
+
+        self.btn_load_preset = QtWidgets.QPushButton("Load Preset")
+        self.btn_load_preset.clicked.connect(self._on_load_preset)
+        btn_row.addWidget(self.btn_load_preset)
+
+        # plotting area: spectrum (top) and spectrogram (bottom)
+        plot_split = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        layout.addWidget(plot_split)
+
+        # spectrum plot
+        self.plot_widget = pg.PlotWidget(title="Spectrum")
+        self.plot_widget.setLogMode(x=True, y=False)  # freq axis log
+        self.plot_widget.setLabel('bottom', 'Frequency', units='Hz')
+        self.plot_widget.setLabel('left', 'Magnitude', units='dB')
+        self.plot_widget.showGrid(True, True, alpha=0.3)
+        self.spectrum_curve = self.plot_widget.plot([], pen='y')
+        plot_split.addWidget(self.plot_widget)
+
+        # annotate peaks via text items
+        self.peak_text_items = []
+
+        # spectrogram (image)
+        self.img_view = ImageView()
+        plot_split.addWidget(self.img_view)
+
+        # optional 3D waterfall
+        if GL_AVAILABLE:
+            self.gl_view = gl.GLViewWidget()
+            self.gl_view.opts['distance'] = 40
+            layout.addWidget(QtWidgets.QLabel("3D Waterfall"))
+            layout.addWidget(self.gl_view)
+            g = gl.GLGridItem()
+            g.scale(1,1,1)
+            self.gl_view.addItem(g)
+
+    # -------------------
+    # UI callbacks
+    # -------------------
+    def _on_fft_change(self, txt):
+        try:
+            n = int(txt)
+            self.fft_size = n
+            self._recalc_freqs()
+        except Exception:
+            pass
+
+    def _on_hop_change(self, val):
+        self.hop = int(val)
+        interval = max(10, int(self.hop / float(self.sr) * 1000.0))
+        self.timer.setInterval(interval)
+
+    def _on_window_change(self, txt):
+        self.window_name = txt
+        self.window_fn = WINDOWS.get(txt, WINDOWS['hann'])
+
+    def _on_smooth_change(self, val):
+        self.smooth_alpha = val / 99.0
+
+    def _on_gain_change(self, val):
+        self.gain = val / 100.0
+
+    def _on_snapshot(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"spectrogram_snapshot_{ts}.png"
+        img = self.img_view.getImageItem().image
+        exporter = pg.exporters.ImageExporter(self.img_view.getView())
+        exporter.parameters()['width'] = img.shape[1]
+        exporter.export(fname)
+        print("Saved snapshot:", fname)
+
+    def _on_record_toggle(self, toggled):
+        if toggled:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = f"recording_{ts}.wav"
+            self.recorder.start(fname)
+            self.btn_record.setText("Stop")
+        else:
+            self.recorder.stop()
+            self.btn_record.setText("Record")
+
+    def _on_save_preset(self):
+        preset = {
+            'fft_size': self.fft_size,
+            'hop': self.hop,
+            'window': self.window_name,
+            'smooth': self.smooth_alpha,
+            'gain': self.gain,
+            'spec_len': self.spec_len,
+        }
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Preset", "", "JSON Files (*.json)")
+        if fname:
+            with open(fname, 'w') as f:
+                json.dump(preset, f, indent=2)
+            print("Preset saved:", fname)
+
+    def _on_load_preset(self):
+        fname, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Preset", "", "JSON Files (*.json)")
+        if fname:
+            with open(fname, 'r') as f:
+                preset = json.load(f)
+            self.fft_size = int(preset.get('fft_size', self.fft_size))
+            self.hop = int(preset.get('hop', self.hop))
+            self.window_name = preset.get('window', self.window_name)
+            self.window_fn = WINDOWS.get(self.window_name, WINDOWS['hann'])
+            self.smooth_alpha = float(preset.get('smooth', self.smooth_alpha))
+            self.gain = float(preset.get('gain', self.gain))
+            self.spec_len = int(preset.get('spec_len', self.spec_len))
+            self.fft_combo.setCurrentText(str(self.fft_size))
+            self.hop_spin.setValue(self.hop)
+            self.window_combo.setCurrentText(self.window_name)
+            self.smooth_slider.setValue(int(self.smooth_alpha*99))
+            self.gain_slider.setValue(int(self.gain*100))
+            print("Preset loaded:", fname)
+            self._recalc_freqs()
+
+    def _recalc_freqs(self):
+        self.freqs = np.fft.rfftfreq(self.fft_size, 1.0/self.sr)
+        self.sgram = np.full((self.freqs.size, self.spec_len), self.db_floor, dtype=float)
+        self.smooth_spec = None
+        self.onset_detector = OnsetDetector(self.fft_size, thr=self.onset_thr)
+
+    # -------------------
+    # Timer update
+    # -------------------
+    def _on_timer(self):
+        block = self.audio_source.read_block()
+        if block is None:
+            return
+        self.buffer = np.concatenate([self.buffer, block])
+        if self.buffer.size < self.fft_size:
+            return
+        frame = self.buffer[:self.fft_size]
+        self.buffer = self.buffer[self.hop:]
+
+        # compute magnitude
+        mag = compute_spectrum(frame * self.gain, self.fft_size, self.window_fn)
+        onset, flux = self.onset_detector.feed(mag)
+        self.recorder.push(frame)
+
+        # smoothing in dB
+        mag_db = db_amp(mag, floor_db=self.db_floor)
+        if self.smooth_spec is None:
+            self.smooth_spec = mag_db
+        else:
+            self.smooth_spec = self.smooth_alpha * self.smooth_spec + (1.0 - self.smooth_alpha) * mag_db
+
+        # update spectrum curve
+        self.spectrum_curve.setData(self.freqs, self.smooth_spec)
+        self.plot_widget.setYRange(self.db_floor, DEFAULT_DB_CEILING)
+
+        # detect peaks
+        peaks = detect_peaks(mag, self.freqs, top_n=self.peak_count, mindb=self.db_floor)
+        
+        # clear previous texts
+        for it in self.peak_text_items:
+            self.plot_widget.removeItem(it)
+        self.peak_text_items = []
+        
+        # Render peaks in log10 space
+        for (f, dbv, idx) in peaks:
+            if f <= 0:  # Avoid log10(0) domain math errors on the DC offset component
+                continue
+            note, cents, _ = freq_to_note_name(f)
+            txt = f"{f:.1f} Hz\n{note} {cents:+.1f}c"
+            ti = pg.TextItem(txt, anchor=(0.5, 1.0), color='w')
+            
+            # Match the plot's setLogMode(x=True) layout transformation
+            ti.setPos(math.log10(f), dbv)
+            
+            self.plot_widget.addItem(ti)
+            self.peak_text_items.append(ti)
+
+        # spectrogram update
+        self.sgram = np.roll(self.sgram, -1, axis=1)
+        self.sgram[:, -1] = mag_db
+        self.img_view.setImage(self.sgram, autoLevels=False, autoRange=False)
+
+        # 3D waterfall update (if available)
+        if GL_AVAILABLE:
+            self.waterfall_history.append(mag_db)
+            self._update_gl_waterfall()
+
+        # Visual feedback for onsets
+        if onset:
+            self.plot_widget.setBackground('k')
+            self.setWindowTitle("DFT Visualizer — ONSET!")
+            QtCore.QTimer.singleShot(150, lambda: self.setWindowTitle("DFT Visualizer — Full Edition"))
+
+    def _update_gl_waterfall(self):
+        hist = np.array(self.waterfall_history)
+        if hist.size == 0:
+            return
+        pass
+
+# ---------------------------
+# CLI and main
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(description="DFT Audio Visualizer — Full Edition")
+    parser.add_argument('--mode', choices=['live', 'file'], required=True)
+    parser.add_argument('--file', type=str, help='If mode=file, path to audio file')
+    parser.add_argument('--sr', type=int, default=DEFAULT_SR)
+    parser.add_argument('--fft', type=int, default=DEFAULT_FFT)
+    parser.add_argument('--hop', type=int, default=DEFAULT_HOP)
+    parser.add_argument('--spec_len', type=int, default=DEFAULT_SPEC_LEN)
+    args = parser.parse_args()
+
+    if args.mode == 'file':
+        if not args.file:
+            print("Error: --file required when mode=file")
+            sys.exit(1)
+        src = FileAudioSource(args.file, blocksize=args.hop)
+        sr = src.sr
+    else:
+        src = LiveAudioSource(sr=args.sr, blocksize=args.hop)
+        sr = args.sr
+
+    # Start Qt app
+    app = QtWidgets.QApplication(sys.argv)
+    vis = VisualizerApp(src, sr, fft_size=args.fft, hop=args.hop, spec_len=args.spec_len)
+    vis.resize(1000, 800)
+    vis.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
