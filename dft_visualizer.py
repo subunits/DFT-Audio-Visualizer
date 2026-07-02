@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DFT Audio Visualizer — Full Edition (Hardened & Polished, v3)
+DFT Audio Visualizer — Full Edition (Hardened & Polished, v3.1)
 Features:
  - PyQt / pyqtgraph real-time visualizer
  - 2D spectrum + scrolling spectrogram
@@ -12,11 +12,11 @@ Features:
  - Two audio sources: live mic (sounddevice) or file (soundfile)
  - Graceful shutdown of audio stream / recorder on window close
 
-Changelog (v3):
- - Fixed a critical memory leak/latency desync bug caught by Claude where main()
-   passed an unclamped hop size to the audio source while the UI clamped it.
- - Fixed a guaranteed AttributeError crash in _on_snapshot by switching to the
-   native self.img_view.export() method.
+Changelog (v3.1):
+ - Fixed a critical AttributeError crash in _on_snapshot by leveraging pyqtgraph.exporters.ImageExporter
+   targeting the explicit view box (`self.img_view.view`).
+ - Hardened onset flash mechanics using an instance-level QTimer to prevent rapid back-to-back
+   onsets from causing overlapping timer race conditions.
 """
 
 import argparse
@@ -289,8 +289,6 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.sr = sr
         self.fft_size = fft_size
 
-        # In v3, this is already safely guaranteed by clamping in main(), 
-        # but we maintain it here to handle downstream dynamic adjustments cleanly.
         self.hop = max(MIN_HOP, min(hop, fft_size))
 
         self.spec_len = spec_len
@@ -313,11 +311,17 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self._build_ui()
         self._apply_colormap()
 
+        # Audio analysis pacing timer
         self.timer = QtCore.QTimer()
         interval = max(5, int(self.hop / float(self.sr) * 1000.0) // 2)
         self.timer.setInterval(interval)
         self.timer.timeout.connect(self._on_timer)
         self.timer.start()
+
+        # Dedicated onset visual flash reset timer
+        self.onset_flash_timer = QtCore.QTimer()
+        self.onset_flash_timer.setSingleShot(True)
+        self.onset_flash_timer.timeout.connect(self._reset_onset_flash)
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -468,15 +472,16 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self._apply_colormap()
 
     def _on_snapshot(self):
-        """v3 fix: pyqtgraph.ImageView has its own native .export() method.
-        Accessing .scene directly causes an AttributeError crash."""
+        """v3.1 Fix: Use the explicit pyqtgraph ImageExporter targetting 
+        the internal ViewBox of the ImageView structure (`self.img_view.view`)"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"spectrogram_snapshot_{ts}.png"
         try:
-            self.img_view.export(fname)
+            exporter = pg.exporters.ImageExporter(self.img_view.view)
+            exporter.export(fname)
             print("Saved snapshot:", fname)
         except Exception as e:
-            print(f"Error saving snapshot via native ImageView export: {e}", file=sys.stderr)
+            print(f"Error saving snapshot via ImageExporter: {e}", file=sys.stderr)
 
     def _on_record_toggle(self, toggled):
         if toggled:
@@ -575,7 +580,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
         for (f, dbv, idx) in peaks:
             if f <= 0:
-                continue
+                return
             note, cents, _ = freq_to_note_name(f)
             txt = f"{f:.1f} Hz\n{note} {cents:+.1f}c"
             ti = pg.TextItem(txt, anchor=(0.5, 1.0), color='w')
@@ -591,15 +596,16 @@ class VisualizerApp(QtWidgets.QMainWindow):
         if onset:
             self.plot_widget.setBackground('#400000')
             self.setWindowTitle("DFT Visualizer — ONSET!")
+            self.onset_flash_timer.start(120)  # Re-starts countdown seamlessly on rapid hits
 
-            def _reset_onset_flash():
-                self.plot_widget.setBackground('k')
-                self.setWindowTitle("DFT Visualizer — Full Edition")
-            QtCore.QTimer.singleShot(120, _reset_onset_flash)
+    def _reset_onset_flash(self):
+        self.plot_widget.setBackground('k')
+        self.setWindowTitle("DFT Visualizer — Full Edition")
 
     def closeEvent(self, event):
         try:
             self.timer.stop()
+            self.onset_flash_timer.stop()
         except Exception:
             pass
         try:
@@ -633,8 +639,6 @@ def main():
         print("Error: --hop must be a positive integer")
         sys.exit(1)
 
-    # v3 fix: Clamp hop relative to the CLI-specified fft up front,
-    # so the audio source hardware buffer and UI advance loop are matched perfectly.
     clamped_hop = max(MIN_HOP, min(args.hop, args.fft))
 
     if args.mode == 'file':
