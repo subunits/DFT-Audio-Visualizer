@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
 """
-DFT Audio Visualizer — Full Edition (Hardened & Polished)
+DFT Audio Visualizer — Full Edition (Hardened & Polished, v2)
 Features:
  - PyQt / pyqtgraph real-time visualizer
  - 2D spectrum + scrolling spectrogram
  - Peak detection + nearest musical note names (A4=440Hz)
  - Onset detection (spectral flux) and beat-sync visual effects
- - GUI controls (FFT size, hop, window, smoothing, gain, colormap)
+ - GUI controls (FFT size, hop, window, smoothing, gain, dB floor, colormap)
  - Presets save/load
  - Recording (write to WAV), snapshot export
  - Two audio sources: live mic (sounddevice) or file (soundfile)
+ - Graceful shutdown of audio stream / recorder on window close
 Usage:
     python dft_visualizer_full.py --mode live
     python dft_visualizer_full.py --mode file --file path/to.wav
 Dependencies:
     pip install numpy scipy sounddevice soundfile pyqtgraph PyQt6
+
+Changelog (v2):
+ - Fixed onset detector false-triggering during startup (unwarmed envelope)
+ - Added try/except around live audio device init with a friendly error
+ - Added closeEvent to stop the mic stream / timer / recorder on exit
+ - Added a real colormap selector for the spectrogram (was promised in the
+   docstring but never implemented)
+ - Added a dB-floor slider (was a tunable field with no UI control)
+ - Fixed hop/FFT clamping so CLI-provided values can't desync the UI state
+ - Custom --fft values not in the preset list are now added to the combo box
 """
 
 import argparse
 import json
 import math
-import os
 import sys
 import time
 import threading
@@ -37,10 +47,12 @@ try:
     from PyQt6 import QtCore, QtWidgets
     from PyQt6.QtCore import Qt
     QT_HORIZONTAL = Qt.Orientation.Horizontal
+    QT_VERTICAL = Qt.Orientation.Vertical
 except Exception:
     from PyQt5 import QtCore, QtWidgets
     from PyQt5.QtCore import Qt
-    QT_HORIZONTAL = Qt.Horizontal 
+    QT_HORIZONTAL = Qt.Horizontal
+    QT_VERTICAL = Qt.Vertical
 
 import pyqtgraph as pg
 import pyqtgraph.exporters
@@ -55,6 +67,10 @@ DEFAULT_SPEC_LEN = 300
 DEFAULT_SMOOTH = 0.7
 DEFAULT_DB_FLOOR = -100.0
 DEFAULT_DB_CEILING = 0.0
+MIN_HOP = 64
+FFT_CHOICES = [512, 1024, 2048, 4096, 8192]
+COLORMAPS = ['viridis', 'plasma', 'inferno', 'grey']
+
 WINDOWS = {
     'hann': np.hanning,
     'hamming': np.hamming,
@@ -68,6 +84,7 @@ WINDOWS = {
 A4_FREQ = 440.0
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
+
 def freq_to_note_name(freq):
     if freq <= 0:
         return ("--", 0.0, None)
@@ -78,6 +95,7 @@ def freq_to_note_name(freq):
     octave = (midi_round // 12) - 1
     return (f"{NOTE_NAMES[note_idx]}{octave}", cents, octave)
 
+
 # ---------------------------
 # DSP: FFT, window, dB
 # ---------------------------
@@ -86,32 +104,59 @@ def db_amp(mag, floor_db=DEFAULT_DB_FLOOR):
         db = 20.0 * np.log10(np.maximum(mag, 1e-12))
     return np.clip(db, floor_db, DEFAULT_DB_CEILING)
 
+
 def compute_spectrum(frame, fft_size, window_fn):
     if frame.shape[0] < fft_size:
         frame = np.pad(frame, (0, fft_size - frame.shape[0]), mode='constant')
     w = window_fn(fft_size)
     frame_win = frame[:fft_size] * w
     spec = np.fft.rfft(frame_win)
-    mag = np.abs(spec) / np.sum(w)
+    denom = np.sum(w)
+    if denom <= 0:
+        denom = 1.0
+    mag = np.abs(spec) / denom
     return mag
 
+
 class OnsetDetector:
-    def __init__(self, thr=4.0, smooth=0.9):
+    """Spectral-flux based onset detector.
+
+    v2 fix: the envelope used to be seeded at 0.0, which meant the very
+    first few frames would (almost) always register as an onset because
+    `flux > max(eps, env*thr)` is trivially true when env is still near
+    zero. We now require a short warm-up period before onsets can fire,
+    and seed the envelope with the first real flux value instead of 0.
+    """
+
+    def __init__(self, thr=4.0, smooth=0.9, warmup_frames=8):
         self.prev_spec = None
         self.thr = thr
         self.smooth = smooth
-        self.env = 0.0
+        self.env = None
+        self.warmup_frames = warmup_frames
+        self._frame_count = 0
 
     def feed(self, mag):
         if self.prev_spec is None:
             self.prev_spec = mag.copy()
             return False, 0.0
+
         diff = mag - self.prev_spec
         flux = np.sum(np.maximum(diff, 0.0))
         self.prev_spec = mag.copy()
-        self.env = self.smooth * self.env + (1 - self.smooth) * flux
+
+        if self.env is None:
+            self.env = flux
+        else:
+            self.env = self.smooth * self.env + (1 - self.smooth) * flux
+
+        self._frame_count += 1
+        if self._frame_count <= self.warmup_frames:
+            return False, flux
+
         onset = flux > max(1e-12, self.env * self.thr)
         return onset, flux
+
 
 def detect_peaks(mags_db, freqs, top_n=5, min_distance=2):
     peak_idx = signal.find_peaks(mags_db, distance=min_distance)[0]
@@ -122,6 +167,7 @@ def detect_peaks(mags_db, freqs, top_n=5, min_distance=2):
     for idx in sorted_idx[:top_n]:
         results.append((freqs[idx], mags_db[idx], idx))
     return results
+
 
 # ---------------------------
 # Audio sources
@@ -142,24 +188,30 @@ class FileAudioSource:
         with self.lock:
             if self.pos >= self.f.shape[0]:
                 return None
-            
+
             if self.start_time is None:
                 self.start_time = time.time()
-            
+
             expected_elapsed = self.samples_read / self.sr
             actual_elapsed = time.time() - self.start_time
             if actual_elapsed < expected_elapsed:
-                return None  
+                return None
 
             end = min(self.pos + self.blocksize, self.f.shape[0])
             block = self.f[self.pos:end, 0].copy()
             actual_size = block.size
             if block.size < self.blocksize:
                 block = np.pad(block, (0, self.blocksize - block.size))
-                
+
             self.pos = end
             self.samples_read += actual_size
             return block
+
+    def close(self):
+        # Nothing to release explicitly (file already fully read into
+        # memory), but kept for a uniform interface with LiveAudioSource.
+        pass
+
 
 class LiveAudioSource:
     def __init__(self, sr=DEFAULT_SR, blocksize=DEFAULT_HOP, channels=1, device=None):
@@ -168,10 +220,17 @@ class LiveAudioSource:
         self.channels = channels
         self.buffer = collections.deque()
         self.lock = threading.Lock()
-        self.stream = sd.InputStream(samplerate=self.sr, blocksize=self.blocksize,
-                                     channels=self.channels, callback=self._callback,
-                                     device=device)
-        self.stream.start()
+        try:
+            self.stream = sd.InputStream(samplerate=self.sr, blocksize=self.blocksize,
+                                          channels=self.channels, callback=self._callback,
+                                          device=device)
+            self.stream.start()
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not open an audio input device (sr={sr}, channels={channels}, "
+                f"device={device!r}). Check that a microphone is connected and available. "
+                f"Original error: {e}"
+            ) from e
 
     def _callback(self, indata, frames, time_info, status):
         if status:
@@ -187,6 +246,16 @@ class LiveAudioSource:
             if not self.buffer:
                 return None
             return self.buffer.popleft()
+
+    def close(self):
+        try:
+            if self.stream is not None and self.stream.active:
+                self.stream.stop()
+            if self.stream is not None:
+                self.stream.close()
+        except Exception as e:
+            print("Error closing audio stream:", e, file=sys.stderr)
+
 
 # ---------------------------
 # Recorder
@@ -227,6 +296,7 @@ class Recorder:
             if self.recording:
                 self._buf.append(block.copy())
 
+
 # ---------------------------
 # GUI / Visualizer (PyQt + pyqtgraph)
 # ---------------------------
@@ -238,7 +308,10 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.audio_source = audio_source
         self.sr = sr
         self.fft_size = fft_size
-        self.hop = min(hop, fft_size)
+
+        # v2 fix: clamp hop consistently up front so self.hop and the
+        # spinbox (min=MIN_HOP, max=fft_size) can never disagree.
+        self.hop = max(MIN_HOP, min(hop, fft_size))
 
         self.spec_len = spec_len
         self.buffer = np.zeros(0, dtype=np.float32)
@@ -249,17 +322,19 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.gain = 1.0
         self.peak_count = 6
         self.onset_thr = 4.0
+        self.colormap_name = 'viridis'
 
-        self.freqs = np.fft.rfftfreq(self.fft_size, 1.0/self.sr)
+        self.freqs = np.fft.rfftfreq(self.fft_size, 1.0 / self.sr)
         self.sgram = np.full((self.freqs.size, self.spec_len), self.db_floor, dtype=float)
         self.smooth_spec = None
         self.onset_detector = OnsetDetector(thr=self.onset_thr)
         self.recorder = Recorder(self.sr)
 
         self._build_ui()
+        self._apply_colormap()
 
         self.timer = QtCore.QTimer()
-        interval = max(5, int(self.hop / float(self.sr) * 1000.0) // 2)  
+        interval = max(5, int(self.hop / float(self.sr) * 1000.0) // 2)
         self.timer.setInterval(interval)
         self.timer.timeout.connect(self._on_timer)
         self.timer.start()
@@ -274,7 +349,13 @@ class VisualizerApp(QtWidgets.QMainWindow):
         layout.addLayout(ctrl_row)
 
         self.fft_combo = QtWidgets.QComboBox()
-        for n in [512, 1024, 2048, 4096, 8192]:
+        choices = list(FFT_CHOICES)
+        if self.fft_size not in choices:
+            # v2 fix: a custom --fft value from the CLI used to leave the
+            # combo box showing nothing selected. Insert it in sorted order.
+            choices.append(self.fft_size)
+            choices.sort()
+        for n in choices:
             self.fft_combo.addItem(str(n))
         self.fft_combo.setCurrentText(str(self.fft_size))
         self.fft_combo.currentTextChanged.connect(self._on_fft_change)
@@ -282,7 +363,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
         ctrl_row.addWidget(self.fft_combo)
 
         self.hop_spin = QtWidgets.QSpinBox()
-        self.hop_spin.setRange(64, self.fft_size)
+        self.hop_spin.setRange(MIN_HOP, self.fft_size)
         self.hop_spin.setValue(self.hop)
         self.hop_spin.valueChanged.connect(self._on_hop_change)
         ctrl_row.addWidget(QtWidgets.QLabel("Hop:"))
@@ -298,21 +379,42 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
         self.smooth_slider = QtWidgets.QSlider(QT_HORIZONTAL)
         self.smooth_slider.setRange(0, 99)
-        self.smooth_slider.setValue(int(self.smooth_alpha*99))
+        self.smooth_slider.setValue(int(self.smooth_alpha * 99))
         self.smooth_slider.valueChanged.connect(self._on_smooth_change)
         ctrl_row.addWidget(QtWidgets.QLabel("Smoothing:"))
         ctrl_row.addWidget(self.smooth_slider)
 
         self.gain_slider = QtWidgets.QSlider(QT_HORIZONTAL)
         self.gain_slider.setRange(1, 400)
-        self.gain_slider.setValue(int(self.gain*100))
+        self.gain_slider.setValue(int(self.gain * 100))
         self.gain_slider.valueChanged.connect(self._on_gain_change)
         ctrl_row.addWidget(QtWidgets.QLabel("Gain:"))
         ctrl_row.addWidget(self.gain_slider)
 
+        ctrl_row2 = QtWidgets.QHBoxLayout()
+        layout.addLayout(ctrl_row2)
+
+        # v2 addition: dB floor was a tunable field with no UI control.
+        self.dbfloor_slider = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.dbfloor_slider.setRange(-140, -20)
+        self.dbfloor_slider.setValue(int(self.db_floor))
+        self.dbfloor_slider.valueChanged.connect(self._on_dbfloor_change)
+        ctrl_row2.addWidget(QtWidgets.QLabel("dB floor:"))
+        ctrl_row2.addWidget(self.dbfloor_slider)
+
+        # v2 addition: colormap selector (was promised in the module
+        # docstring but never actually implemented).
+        self.colormap_combo = QtWidgets.QComboBox()
+        for c in COLORMAPS:
+            self.colormap_combo.addItem(c)
+        self.colormap_combo.setCurrentText(self.colormap_name)
+        self.colormap_combo.currentTextChanged.connect(self._on_colormap_change)
+        ctrl_row2.addWidget(QtWidgets.QLabel("Colormap:"))
+        ctrl_row2.addWidget(self.colormap_combo)
+
         btn_row = QtWidgets.QHBoxLayout()
         layout.addLayout(btn_row)
-        
+
         self.btn_snapshot = QtWidgets.QPushButton("Snapshot")
         self.btn_snapshot.clicked.connect(self._on_snapshot)
         btn_row.addWidget(self.btn_snapshot)
@@ -330,7 +432,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.btn_load_preset.clicked.connect(self._on_load_preset)
         btn_row.addWidget(self.btn_load_preset)
 
-        plot_split = QtWidgets.QSplitter(Qt.Orientation.Vertical if hasattr(Qt, "Orientation") else Qt.Vertical)
+        plot_split = QtWidgets.QSplitter(QT_VERTICAL)
         layout.addWidget(plot_split)
 
         self.plot_widget = pg.PlotWidget(title="Spectrum")
@@ -348,6 +450,13 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.img_view.ui.menuBtn.hide()
         plot_split.addWidget(self.img_view)
 
+    def _apply_colormap(self):
+        try:
+            cmap = pg.colormap.get(self.colormap_name)
+            self.img_view.setColorMap(cmap)
+        except Exception as e:
+            print("Could not apply colormap:", e, file=sys.stderr)
+
     def _on_fft_change(self, txt):
         try:
             n = int(txt)
@@ -361,7 +470,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
             pass
 
     def _on_hop_change(self, val):
-        self.hop = max(1, min(int(val), self.fft_size))
+        self.hop = max(MIN_HOP, min(int(val), self.fft_size))
         interval = max(5, int(self.hop / float(self.sr) * 1000.0) // 2)
         self.timer.setInterval(interval)
 
@@ -374,6 +483,14 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
     def _on_gain_change(self, val):
         self.gain = val / 100.0
+
+    def _on_dbfloor_change(self, val):
+        self.db_floor = float(val)
+        self.plot_widget.setYRange(self.db_floor, DEFAULT_DB_CEILING)
+
+    def _on_colormap_change(self, txt):
+        self.colormap_name = txt
+        self._apply_colormap()
 
     def _on_snapshot(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -400,6 +517,8 @@ class VisualizerApp(QtWidgets.QMainWindow):
             'smooth': self.smooth_alpha,
             'gain': self.gain,
             'spec_len': self.spec_len,
+            'db_floor': self.db_floor,
+            'colormap': self.colormap_name,
         }
         fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Preset", "", "JSON Files (*.json)")
         if fname:
@@ -414,22 +533,30 @@ class VisualizerApp(QtWidgets.QMainWindow):
                 preset = json.load(f)
             self.fft_size = int(preset.get('fft_size', self.fft_size))
             self.hop_spin.setMaximum(self.fft_size)
-            self.hop = min(int(preset.get('hop', self.hop)), self.fft_size)
+            self.hop = max(MIN_HOP, min(int(preset.get('hop', self.hop)), self.fft_size))
             self.window_name = preset.get('window', self.window_name)
             self.window_fn = WINDOWS.get(self.window_name, WINDOWS['hann'])
             self.smooth_alpha = float(preset.get('smooth', self.smooth_alpha))
             self.gain = float(preset.get('gain', self.gain))
             self.spec_len = int(preset.get('spec_len', self.spec_len))
+            self.db_floor = float(preset.get('db_floor', self.db_floor))
+            self.colormap_name = preset.get('colormap', self.colormap_name)
+
+            if str(self.fft_size) not in [self.fft_combo.itemText(i) for i in range(self.fft_combo.count())]:
+                self.fft_combo.addItem(str(self.fft_size))
             self.fft_combo.setCurrentText(str(self.fft_size))
             self.hop_spin.setValue(self.hop)
             self.window_combo.setCurrentText(self.window_name)
-            self.smooth_slider.setValue(int(self.smooth_alpha*99))
-            self.gain_slider.setValue(int(self.gain*100))
+            self.smooth_slider.setValue(int(self.smooth_alpha * 99))
+            self.gain_slider.setValue(int(self.gain * 100))
+            self.dbfloor_slider.setValue(int(self.db_floor))
+            self.colormap_combo.setCurrentText(self.colormap_name)
+            self._apply_colormap()
             print("Preset loaded:", fname)
             self._recalc_freqs()
 
     def _recalc_freqs(self):
-        self.freqs = np.fft.rfftfreq(self.fft_size, 1.0/self.sr)
+        self.freqs = np.fft.rfftfreq(self.fft_size, 1.0 / self.sr)
         self.sgram = np.full((self.freqs.size, self.spec_len), self.db_floor, dtype=float)
         self.smooth_spec = None
         self.buffer = np.zeros(0, dtype=np.float32)
@@ -442,10 +569,10 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
         self.recorder.push(block)
         self.buffer = np.concatenate([self.buffer, block])
-        
+
         if self.buffer.size < self.fft_size:
             return
-            
+
         frame = self.buffer[:self.fft_size]
         self.buffer = self.buffer[self.hop:]
 
@@ -466,7 +593,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
         for it in self.peak_text_items:
             self.plot_widget.removeItem(it)
         self.peak_text_items = []
-        
+
         for (f, dbv, idx) in peaks:
             if f <= 0:
                 continue
@@ -474,7 +601,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
             txt = f"{f:.1f} Hz\n{note} {cents:+.1f}c"
             ti = pg.TextItem(txt, anchor=(0.5, 1.0), color='w')
             ti.setPos(math.log10(f), dbv)
-            
+
             self.plot_widget.addItem(ti)
             self.peak_text_items.append(ti)
 
@@ -491,6 +618,28 @@ class VisualizerApp(QtWidgets.QMainWindow):
                 self.setWindowTitle("DFT Visualizer — Full Edition")
             QtCore.QTimer.singleShot(120, _reset_onset_flash)
 
+    def closeEvent(self, event):
+        """v2 addition: previously the mic stream and any active recording
+        were never explicitly stopped on window close, leaking the audio
+        thread/device handle and silently dropping unsaved recordings."""
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        try:
+            if self.recorder.recording:
+                self.recorder.stop()
+        except Exception as e:
+            print("Error stopping recorder on close:", e, file=sys.stderr)
+        try:
+            close_fn = getattr(self.audio_source, 'close', None)
+            if callable(close_fn):
+                close_fn()
+        except Exception as e:
+            print("Error closing audio source on close:", e, file=sys.stderr)
+        event.accept()
+
+
 def main():
     parser = argparse.ArgumentParser(description="DFT Audio Visualizer — Full Edition")
     parser.add_argument('--mode', choices=['live', 'file'], required=True)
@@ -501,14 +650,29 @@ def main():
     parser.add_argument('--spec_len', type=int, default=DEFAULT_SPEC_LEN)
     args = parser.parse_args()
 
+    if args.fft <= 0:
+        print("Error: --fft must be a positive integer")
+        sys.exit(1)
+    if args.hop <= 0:
+        print("Error: --hop must be a positive integer")
+        sys.exit(1)
+
     if args.mode == 'file':
         if not args.file:
             print("Error: --file required when mode=file")
             sys.exit(1)
-        src = FileAudioSource(args.file, blocksize=args.hop)
+        try:
+            src = FileAudioSource(args.file, blocksize=args.hop)
+        except Exception as e:
+            print(f"Error: could not open audio file '{args.file}': {e}")
+            sys.exit(1)
         sr = src.sr
     else:
-        src = LiveAudioSource(sr=args.sr, blocksize=args.hop)
+        try:
+            src = LiveAudioSource(sr=args.sr, blocksize=args.hop)
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
         sr = args.sr
 
     app = QtWidgets.QApplication(sys.argv)
@@ -516,6 +680,7 @@ def main():
     vis.resize(1000, 800)
     vis.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
