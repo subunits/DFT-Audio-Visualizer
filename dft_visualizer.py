@@ -22,7 +22,7 @@ Changelog (v2):
  - Added try/except around live audio device init with a friendly error
  - Added closeEvent to stop the mic stream / timer / recorder on exit
  - Added a real colormap selector for the spectrogram (was promised in the
-   docstring but never implemented)
+    docstring but never implemented)
  - Added a dB-floor slider (was a tunable field with no UI control)
  - Fixed hop/FFT clamping so CLI-provided values can't desync the UI state
  - Custom --fft values not in the preset list are now added to the combo box
@@ -222,8 +222,8 @@ class LiveAudioSource:
         self.lock = threading.Lock()
         try:
             self.stream = sd.InputStream(samplerate=self.sr, blocksize=self.blocksize,
-                                          channels=self.channels, callback=self._callback,
-                                          device=device)
+                                         channels=self.channels, callback=self._callback,
+                                         device=device)
             self.stream.start()
         except Exception as e:
             raise RuntimeError(
