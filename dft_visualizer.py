@@ -4,7 +4,6 @@ DFT Audio Visualizer — Full Edition (Fixed Peak Annotations)
 Features:
  - PyQt / pyqtgraph real-time visualizer
  - 2D spectrum + scrolling spectrogram
- - 3D waterfall (OpenGL) if available
  - Peak detection + nearest musical note names (A4=440Hz)
  - Onset detection (spectral flux) and beat-sync visual effects
  - GUI controls (FFT size, hop, window, smoothing, gain, colormap)
@@ -43,13 +42,6 @@ except Exception:
 
 import pyqtgraph as pg
 from pyqtgraph import ImageView
-
-# Optional OpenGL waterfall
-try:
-    import pyqtgraph.opengl as gl
-    GL_AVAILABLE = True
-except Exception:
-    GL_AVAILABLE = False
 
 # ---------------------------
 # Defaults / parameters
@@ -113,15 +105,12 @@ class OnsetDetector:
         self.onset_flag = False
 
     def feed(self, mag):
-        # mag is linear magnitude (not dB)
         if self.prev_spec is None:
             self.prev_spec = mag.copy()
             return False, 0.0
-        # spectral flux: half-wave of (mag - prev)
         diff = mag - self.prev_spec
         flux = np.sum(np.maximum(diff, 0.0))
         self.prev_spec = mag.copy()
-        # simple adaptive threshold via envelope
         self.env = self.smooth * self.env + (1 - self.smooth) * flux
         # detect onset when flux > env * thr
         onset = flux > max(1e-12, self.env * self.thr)
@@ -129,14 +118,10 @@ class OnsetDetector:
 
 # Peak detector: find top N local peaks in magnitude spectrum
 def detect_peaks(mag, freqs, top_n=5, mindb=-120.0):
-    # mag: linear magnitude
-    # convert to dB for thresholding
     mags_db = db_amp(mag, floor_db=mindb)
-    # find local maxima
     peak_idx = signal.find_peaks(mags_db, distance=2)[0]
     if len(peak_idx) == 0:
         return []
-    # sort peaks by magnitude
     sorted_idx = peak_idx[np.argsort(mags_db[peak_idx])[::-1]]
     results = []
     for idx in sorted_idx[:top_n]:
@@ -185,7 +170,6 @@ class LiveAudioSource:
         block = indata[:, 0].copy()
         with self.lock:
             self.buffer.append(block)
-            # limit buffer length
             while len(self.buffer) > 200:
                 self.buffer.popleft()
 
@@ -272,19 +256,12 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
         # timer for update
         self.timer = QtCore.QTimer()
-        # aim for ~hop / sr * 1000 ms, ensure not too fast
         interval = max(10, int(self.hop / float(self.sr) * 1000.0))
         self.timer.setInterval(interval)
         self.timer.timeout.connect(self._on_timer)
         self.timer.start()
 
-        # For 3D waterfall history (GL)
-        if GL_AVAILABLE:
-            self.waterfall_mesh = None
-            self.waterfall_history = collections.deque(maxlen=self.spec_len)
-
     def _build_ui(self):
-        # central widget
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout()
@@ -336,9 +313,10 @@ class VisualizerApp(QtWidgets.QMainWindow):
         ctrl_row.addWidget(QtWidgets.QLabel("Gain:"))
         ctrl_row.addWidget(self.gain_slider)
 
-        # buttons: snapshot, record, presets
+        # buttons row
         btn_row = QtWidgets.QHBoxLayout()
         layout.addLayout(btn_row)
+        
         self.btn_snapshot = QtWidgets.QPushButton("Snapshot")
         self.btn_snapshot.clicked.connect(self._on_snapshot)
         btn_row.addWidget(self.btn_snapshot)
@@ -362,7 +340,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
         # spectrum plot
         self.plot_widget = pg.PlotWidget(title="Spectrum")
-        self.plot_widget.setLogMode(x=True, y=False)  # freq axis log
+        self.plot_widget.setLogMode(x=True, y=False)
         self.plot_widget.setLabel('bottom', 'Frequency', units='Hz')
         self.plot_widget.setLabel('left', 'Magnitude', units='dB')
         self.plot_widget.showGrid(True, True, alpha=0.3)
@@ -375,16 +353,6 @@ class VisualizerApp(QtWidgets.QMainWindow):
         # spectrogram (image)
         self.img_view = ImageView()
         plot_split.addWidget(self.img_view)
-
-        # optional 3D waterfall
-        if GL_AVAILABLE:
-            self.gl_view = gl.GLViewWidget()
-            self.gl_view.opts['distance'] = 40
-            layout.addWidget(QtWidgets.QLabel("3D Waterfall"))
-            layout.addWidget(self.gl_view)
-            g = gl.GLGridItem()
-            g.scale(1,1,1)
-            self.gl_view.addItem(g)
 
     # -------------------
     # UI callbacks
@@ -511,13 +479,11 @@ class VisualizerApp(QtWidgets.QMainWindow):
         
         # Render peaks in log10 space
         for (f, dbv, idx) in peaks:
-            if f <= 0:  # Avoid log10(0) domain math errors on the DC offset component
+            if f <= 0:
                 continue
             note, cents, _ = freq_to_note_name(f)
             txt = f"{f:.1f} Hz\n{note} {cents:+.1f}c"
             ti = pg.TextItem(txt, anchor=(0.5, 1.0), color='w')
-            
-            # Match the plot's setLogMode(x=True) layout transformation
             ti.setPos(math.log10(f), dbv)
             
             self.plot_widget.addItem(ti)
@@ -528,22 +494,11 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.sgram[:, -1] = mag_db
         self.img_view.setImage(self.sgram, autoLevels=False, autoRange=False)
 
-        # 3D waterfall update (if available)
-        if GL_AVAILABLE:
-            self.waterfall_history.append(mag_db)
-            self._update_gl_waterfall()
-
         # Visual feedback for onsets
         if onset:
             self.plot_widget.setBackground('k')
             self.setWindowTitle("DFT Visualizer — ONSET!")
             QtCore.QTimer.singleShot(150, lambda: self.setWindowTitle("DFT Visualizer — Full Edition"))
-
-    def _update_gl_waterfall(self):
-        hist = np.array(self.waterfall_history)
-        if hist.size == 0:
-            return
-        pass
 
 # ---------------------------
 # CLI and main
@@ -568,7 +523,6 @@ def main():
         src = LiveAudioSource(sr=args.sr, blocksize=args.hop)
         sr = args.sr
 
-    # Start Qt app
     app = QtWidgets.QApplication(sys.argv)
     vis = VisualizerApp(src, sr, fft_size=args.fft, hop=args.hop, spec_len=args.spec_len)
     vis.resize(1000, 800)
