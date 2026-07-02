@@ -15,6 +15,26 @@ Usage:
     python dft_visualizer_full.py --mode file --file path/to.wav
 Dependencies:
     pip install numpy scipy sounddevice soundfile pyqtgraph PyQt6
+
+---------------------------------------------------------------------
+FIXES APPLIED IN THIS VERSION (see inline "FIX:" comments):
+ 1. PyQt5/PyQt6 slider orientation compatibility (Qt.Horizontal vs
+    Qt.Orientation.Horizontal) — previously crashed under PyQt5.
+ 2. Recorder now records the exact incoming audio block instead of
+    re-recording the whole overlapping analysis frame every tick,
+    which was duplicating samples in the saved WAV file.
+ 3. Peak detection now runs on the same smoothed dB spectrum that's
+    drawn on screen, so the peak/note labels line up with the curve
+    instead of jittering independently from unsmoothed data.
+ 4. Hop size is now clamped to <= FFT size (both when the user edits
+    the hop spinbox and when FFT size changes), preventing the
+    rolling buffer from silently losing samples.
+ 5. Onset "flash" now properly restores the plot background color,
+    not just the window title (previously the background stayed
+    black forever after the first onset).
+ 6. OnsetDetector's constructor no longer takes an unused fft_size
+    argument that was easy to confuse with the threshold parameter.
+---------------------------------------------------------------------
 """
 
 import argparse
@@ -36,9 +56,11 @@ import soundfile as sf
 try:
     from PyQt6 import QtCore, QtWidgets
     from PyQt6.QtCore import Qt
+    QT_HORIZONTAL = Qt.Orientation.Horizontal
 except Exception:
     from PyQt5 import QtCore, QtWidgets
     from PyQt5.QtCore import Qt
+    QT_HORIZONTAL = Qt.Horizontal  # FIX: PyQt5 uses a flat enum, not Qt.Orientation.*
 
 import pyqtgraph as pg
 from pyqtgraph import ImageView
@@ -97,7 +119,10 @@ def compute_spectrum(frame, fft_size, window_fn):
 
 # Simple spectral flux onset detector
 class OnsetDetector:
-    def __init__(self, fft_size, thr=4.0, smooth=0.9):
+    # FIX: dropped the unused `fft_size` constructor argument — it was
+    # never stored or used, and its presence made it easy to accidentally
+    # pass it into the `thr` slot at the call site.
+    def __init__(self, thr=4.0, smooth=0.9):
         self.prev_spec = None
         self.thr = thr
         self.smooth = smooth
@@ -116,10 +141,13 @@ class OnsetDetector:
         onset = flux > max(1e-12, self.env * self.thr)
         return onset, flux
 
-# Peak detector: find top N local peaks in magnitude spectrum
-def detect_peaks(mag, freqs, top_n=5, mindb=-120.0):
-    mags_db = db_amp(mag, floor_db=mindb)
-    peak_idx = signal.find_peaks(mags_db, distance=2)[0]
+# Peak detector: find top N local peaks in an already-computed dB spectrum.
+# FIX: this now takes a dB-domain spectrum directly (instead of linear
+# magnitude that got re-converted to dB internally). Callers pass the
+# same smoothed dB array that's plotted, so peak markers track the
+# visible curve instead of an independent, unsmoothed spectrum.
+def detect_peaks(mags_db, freqs, top_n=5, min_distance=2):
+    peak_idx = signal.find_peaks(mags_db, distance=min_distance)[0]
     if len(peak_idx) == 0:
         return []
     sorted_idx = peak_idx[np.argsort(mags_db[peak_idx])[::-1]]
@@ -229,7 +257,8 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.audio_source = audio_source
         self.sr = sr
         self.fft_size = fft_size
-        self.hop = hop
+        self.hop = min(hop, fft_size)  # FIX: never start with hop > fft_size
+
         self.spec_len = spec_len
 
         # internal buffer for overlapping frames
@@ -246,7 +275,8 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.freqs = np.fft.rfftfreq(self.fft_size, 1.0/self.sr)
         self.sgram = np.full((self.freqs.size, self.spec_len), self.db_floor, dtype=float)
         self.smooth_spec = None
-        self.onset_detector = OnsetDetector(self.fft_size, thr=self.onset_thr)
+        # FIX: no more stray fft_size positional arg here
+        self.onset_detector = OnsetDetector(thr=self.onset_thr)
 
         # recorder
         self.recorder = Recorder(self.sr)
@@ -282,7 +312,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
         # hop
         self.hop_spin = QtWidgets.QSpinBox()
-        self.hop_spin.setRange(64, 8192)
+        self.hop_spin.setRange(64, self.fft_size)  # FIX: cap at current fft_size
         self.hop_spin.setValue(self.hop)
         self.hop_spin.valueChanged.connect(self._on_hop_change)
         ctrl_row.addWidget(QtWidgets.QLabel("Hop:"))
@@ -298,7 +328,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
         ctrl_row.addWidget(self.window_combo)
 
         # smoothing
-        self.smooth_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.smooth_slider = QtWidgets.QSlider(QT_HORIZONTAL)  # FIX: compat constant
         self.smooth_slider.setRange(0, 99)
         self.smooth_slider.setValue(int(self.smooth_alpha*99))
         self.smooth_slider.valueChanged.connect(self._on_smooth_change)
@@ -306,7 +336,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
         ctrl_row.addWidget(self.smooth_slider)
 
         # gain
-        self.gain_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.gain_slider = QtWidgets.QSlider(QT_HORIZONTAL)  # FIX: compat constant
         self.gain_slider.setRange(1, 400)
         self.gain_slider.setValue(int(self.gain*100))
         self.gain_slider.valueChanged.connect(self._on_gain_change)
@@ -335,7 +365,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
         btn_row.addWidget(self.btn_load_preset)
 
         # plotting area: spectrum (top) and spectrogram (bottom)
-        plot_split = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        plot_split = QtWidgets.QSplitter(Qt.Orientation.Vertical if hasattr(Qt, "Orientation") else Qt.Vertical)
         layout.addWidget(plot_split)
 
         # spectrum plot
@@ -361,12 +391,19 @@ class VisualizerApp(QtWidgets.QMainWindow):
         try:
             n = int(txt)
             self.fft_size = n
+            # FIX: keep hop <= fft_size whenever fft_size changes
+            self.hop_spin.setMaximum(n)
+            if self.hop > n:
+                self.hop = n
+                self.hop_spin.setValue(n)
             self._recalc_freqs()
         except Exception:
             pass
 
     def _on_hop_change(self, val):
-        self.hop = int(val)
+        # FIX: clamp hop to fft_size so the rolling buffer can't be
+        # trimmed by more than it actually contains
+        self.hop = max(1, min(int(val), self.fft_size))
         interval = max(10, int(self.hop / float(self.sr) * 1000.0))
         self.timer.setInterval(interval)
 
@@ -420,7 +457,8 @@ class VisualizerApp(QtWidgets.QMainWindow):
             with open(fname, 'r') as f:
                 preset = json.load(f)
             self.fft_size = int(preset.get('fft_size', self.fft_size))
-            self.hop = int(preset.get('hop', self.hop))
+            self.hop_spin.setMaximum(self.fft_size)  # FIX: keep bound consistent
+            self.hop = min(int(preset.get('hop', self.hop)), self.fft_size)
             self.window_name = preset.get('window', self.window_name)
             self.window_fn = WINDOWS.get(self.window_name, WINDOWS['hann'])
             self.smooth_alpha = float(preset.get('smooth', self.smooth_alpha))
@@ -438,7 +476,8 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.freqs = np.fft.rfftfreq(self.fft_size, 1.0/self.sr)
         self.sgram = np.full((self.freqs.size, self.spec_len), self.db_floor, dtype=float)
         self.smooth_spec = None
-        self.onset_detector = OnsetDetector(self.fft_size, thr=self.onset_thr)
+        self.buffer = np.zeros(0, dtype=np.float32)  # FIX: stale buffer from old fft_size could desync frames
+        self.onset_detector = OnsetDetector(thr=self.onset_thr)
 
     # -------------------
     # Timer update
@@ -447,6 +486,14 @@ class VisualizerApp(QtWidgets.QMainWindow):
         block = self.audio_source.read_block()
         if block is None:
             return
+
+        # FIX: record the exact incoming block, not the overlapping
+        # analysis frame — previously `recorder.push(frame)` re-saved
+        # most of the same samples on every tick (since consecutive
+        # frames overlap whenever hop < fft_size), badly duplicating
+        # audio in the output WAV.
+        self.recorder.push(block)
+
         self.buffer = np.concatenate([self.buffer, block])
         if self.buffer.size < self.fft_size:
             return
@@ -456,7 +503,6 @@ class VisualizerApp(QtWidgets.QMainWindow):
         # compute magnitude
         mag = compute_spectrum(frame * self.gain, self.fft_size, self.window_fn)
         onset, flux = self.onset_detector.feed(mag)
-        self.recorder.push(frame)
 
         # smoothing in dB
         mag_db = db_amp(mag, floor_db=self.db_floor)
@@ -469,9 +515,10 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.spectrum_curve.setData(self.freqs, self.smooth_spec)
         self.plot_widget.setYRange(self.db_floor, DEFAULT_DB_CEILING)
 
-        # detect peaks
-        peaks = detect_peaks(mag, self.freqs, top_n=self.peak_count, mindb=self.db_floor)
-        
+        # FIX: detect peaks on the same smoothed dB spectrum that's
+        # plotted, so the labels track the visible curve
+        peaks = detect_peaks(self.smooth_spec, self.freqs, top_n=self.peak_count)
+
         # clear previous texts
         for it in self.peak_text_items:
             self.plot_widget.removeItem(it)
@@ -498,7 +545,14 @@ class VisualizerApp(QtWidgets.QMainWindow):
         if onset:
             self.plot_widget.setBackground('k')
             self.setWindowTitle("DFT Visualizer — ONSET!")
-            QtCore.QTimer.singleShot(150, lambda: self.setWindowTitle("DFT Visualizer — Full Edition"))
+
+            # FIX: previously only the window title was restored after
+            # the flash; the background stayed black forever after the
+            # first onset. Now both are restored together.
+            def _reset_onset_flash():
+                self.plot_widget.setBackground('default')
+                self.setWindowTitle("DFT Visualizer — Full Edition")
+            QtCore.QTimer.singleShot(150, _reset_onset_flash)
 
 # ---------------------------
 # CLI and main
