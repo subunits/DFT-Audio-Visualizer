@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """
-DFT Audio Visualizer — Full Edition (Hardened & Polished, v3.1)
-Features:
- - PyQt / pyqtgraph real-time visualizer
- - 2D spectrum + scrolling spectrogram
- - Peak detection + nearest musical note names (A4=440Hz)
- - Onset detection (spectral flux) and beat-sync visual effects
- - GUI controls (FFT size, hop, window, smoothing, gain, dB floor, colormap)
- - Presets save/load
- - Recording (write to WAV), snapshot export
- - Two audio sources: live mic (sounddevice) or file (soundfile)
- - Graceful shutdown of audio stream / recorder on window close
+DFT Audio Visualizer — Full Edition (Hardened & Polished, v3.1-PATCHED)
 
-Changelog (v3.1):
- - Fixed a critical AttributeError crash in _on_snapshot by leveraging pyqtgraph.exporters.ImageExporter
-   targeting the explicit view box (`self.img_view.view`).
- - Hardened onset flash mechanics using an instance-level QTimer to prevent rapid back-to-back
-   onsets from causing overlapping timer race conditions.
+CHANGES FROM v3.1:
+ ✓ Fixed peak detection early-return bug (line 608: return → continue)
+ ✓ Added window-close race condition protection (is_closing flag)
+ ✓ Added bounds checking for peak_count
+ ✓ Added exception handling in peak label cleanup
+ ✓ Added onset threshold UI slider
+ ✓ Improved error messages with status feedback
+ ✓ Protected FFT size change with flag
 """
 
 import argparse
@@ -284,10 +277,11 @@ class VisualizerApp(QtWidgets.QMainWindow):
     def __init__(self, audio_source, sr, fft_size=DEFAULT_FFT, hop=DEFAULT_HOP,
                  spec_len=DEFAULT_SPEC_LEN):
         super().__init__()
-        self.setWindowTitle("DFT Visualizer — Full Edition")
+        self.setWindowTitle("DFT Visualizer — Full Edition (PATCHED)")
         self.audio_source = audio_source
         self.sr = sr
         self.fft_size = fft_size
+        self.is_closing = False  # ✓ PATCHED: Race condition protection
 
         self.hop = max(MIN_HOP, min(hop, fft_size))
 
@@ -301,6 +295,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.peak_count = 6
         self.onset_thr = 4.0
         self.colormap_name = 'viridis'
+        self.fft_changing = False  # ✓ PATCHED: Protect FFT resize
 
         self.freqs = np.fft.rfftfreq(self.fft_size, 1.0 / self.sr)
         self.sgram = np.full((self.freqs.size, self.spec_len), self.db_floor, dtype=float)
@@ -383,6 +378,14 @@ class VisualizerApp(QtWidgets.QMainWindow):
         ctrl_row2.addWidget(QtWidgets.QLabel("dB floor:"))
         ctrl_row2.addWidget(self.dbfloor_slider)
 
+        # ✓ PATCHED: Added onset threshold slider
+        self.onset_thr_slider = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.onset_thr_slider.setRange(1, 30)
+        self.onset_thr_slider.setValue(int(self.onset_thr * 2))
+        self.onset_thr_slider.valueChanged.connect(self._on_onset_thr_change)
+        ctrl_row2.addWidget(QtWidgets.QLabel("Onset Thr:"))
+        ctrl_row2.addWidget(self.onset_thr_slider)
+
         self.colormap_combo = QtWidgets.QComboBox()
         for c in COLORMAPS:
             self.colormap_combo.addItem(c)
@@ -411,6 +414,9 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.btn_load_preset.clicked.connect(self._on_load_preset)
         btn_row.addWidget(self.btn_load_preset)
 
+        # ✓ PATCHED: Status bar for feedback
+        self.statusBar().showMessage("Ready")
+
         plot_split = QtWidgets.QSplitter(QT_VERTICAL)
         layout.addWidget(plot_split)
 
@@ -433,20 +439,24 @@ class VisualizerApp(QtWidgets.QMainWindow):
         try:
             cmap = pg.colormap.get(self.colormap_name)
             self.img_view.setColorMap(cmap)
+            self.statusBar().showMessage(f"Colormap: {self.colormap_name}")
         except Exception as e:
-            print("Could not apply colormap:", e, file=sys.stderr)
+            self.statusBar().showMessage(f"Colormap error: {e}")
 
     def _on_fft_change(self, txt):
         try:
             n = int(txt)
+            self.fft_changing = True  # ✓ PATCHED: Protect resize
             self.fft_size = n
             self.hop_spin.setMaximum(n)
             if self.hop > n:
                 self.hop = n
                 self.hop_spin.setValue(n)
             self._recalc_freqs()
-        except Exception:
-            pass
+            self.fft_changing = False
+        except Exception as e:
+            self.statusBar().showMessage(f"FFT change error: {e}")
+            self.fft_changing = False
 
     def _on_hop_change(self, val):
         self.hop = max(MIN_HOP, min(int(val), self.fft_size))
@@ -467,6 +477,11 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.db_floor = float(val)
         self.plot_widget.setYRange(self.db_floor, DEFAULT_DB_CEILING)
 
+    # ✓ PATCHED: Added onset threshold control
+    def _on_onset_thr_change(self, val):
+        self.onset_thr = val / 2.0
+        self.onset_detector.thr = self.onset_thr
+
     def _on_colormap_change(self, txt):
         self.colormap_name = txt
         self._apply_colormap()
@@ -479,19 +494,21 @@ class VisualizerApp(QtWidgets.QMainWindow):
         try:
             exporter = pg.exporters.ImageExporter(self.img_view.view)
             exporter.export(fname)
-            print("Saved snapshot:", fname)
+            self.statusBar().showMessage(f"✓ Snapshot: {fname}")
         except Exception as e:
-            print(f"Error saving snapshot via ImageExporter: {e}", file=sys.stderr)
+            self.statusBar().showMessage(f"✗ Snapshot failed: {e}")
 
     def _on_record_toggle(self, toggled):
         if toggled:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             fname = f"recording_{ts}.wav"
             self.recorder.start(fname)
-            self.btn_record.setText("Stop")
+            self.btn_record.setText("Stop Recording")
+            self.statusBar().showMessage(f"▶ Recording: {fname}")
         else:
             self.recorder.stop()
             self.btn_record.setText("Record")
+            self.statusBar().showMessage("Recording stopped")
 
     def _on_save_preset(self):
         preset = {
@@ -503,41 +520,51 @@ class VisualizerApp(QtWidgets.QMainWindow):
             'spec_len': self.spec_len,
             'db_floor': self.db_floor,
             'colormap': self.colormap_name,
+            'onset_thr': self.onset_thr,
         }
         fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Preset", "", "JSON Files (*.json)")
         if fname:
-            with open(fname, 'w') as f:
-                json.dump(preset, f, indent=2)
-            print("Preset saved:", fname)
+            try:
+                with open(fname, 'w') as f:
+                    json.dump(preset, f, indent=2)
+                self.statusBar().showMessage(f"✓ Preset saved: {fname}")
+            except Exception as e:
+                self.statusBar().showMessage(f"✗ Save failed: {e}")
 
     def _on_load_preset(self):
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Preset", "", "JSON Files (*.json)")
         if fname:
-            with open(fname, 'r') as f:
-                preset = json.load(f)
-            self.fft_size = int(preset.get('fft_size', self.fft_size))
-            self.hop_spin.setMaximum(self.fft_size)
-            self.hop = max(MIN_HOP, min(int(preset.get('hop', self.hop)), self.fft_size))
-            self.window_name = preset.get('window', self.window_name)
-            self.window_fn = WINDOWS.get(self.window_name, WINDOWS['hann'])
-            self.smooth_alpha = float(preset.get('smooth', self.smooth_alpha))
-            self.gain = float(preset.get('gain', self.gain))
-            self.spec_len = int(preset.get('spec_len', self.spec_len))
-            self.db_floor = float(preset.get('db_floor', self.db_floor))
-            self.colormap_name = preset.get('colormap', self.colormap_name)
+            try:
+                with open(fname, 'r') as f:
+                    preset = json.load(f)
+                self.fft_size = int(preset.get('fft_size', self.fft_size))
+                self.hop_spin.setMaximum(self.fft_size)
+                self.hop = max(MIN_HOP, min(int(preset.get('hop', self.hop)), self.fft_size))
+                self.window_name = preset.get('window', self.window_name)
+                self.window_fn = WINDOWS.get(self.window_name, WINDOWS['hann'])
+                self.smooth_alpha = float(preset.get('smooth', self.smooth_alpha))
+                self.gain = float(preset.get('gain', self.gain))
+                self.spec_len = int(preset.get('spec_len', self.spec_len))
+                self.db_floor = float(preset.get('db_floor', self.db_floor))
+                self.colormap_name = preset.get('colormap', self.colormap_name)
+                # ✓ PATCHED: Load onset threshold
+                self.onset_thr = float(preset.get('onset_thr', self.onset_thr))
 
-            if str(self.fft_size) not in [self.fft_combo.itemText(i) for i in range(self.fft_combo.count())]:
-                self.fft_combo.addItem(str(self.fft_size))
-            self.fft_combo.setCurrentText(str(self.fft_size))
-            self.hop_spin.setValue(self.hop)
-            self.window_combo.setCurrentText(self.window_name)
-            self.smooth_slider.setValue(int(self.smooth_alpha * 99))
-            self.gain_slider.setValue(int(self.gain * 100))
-            self.dbfloor_slider.setValue(int(self.db_floor))
-            self.colormap_combo.setCurrentText(self.colormap_name)
-            self._apply_colormap()
-            print("Preset loaded:", fname)
-            self._recalc_freqs()
+                if str(self.fft_size) not in [self.fft_combo.itemText(i) for i in range(self.fft_combo.count())]:
+                    self.fft_combo.addItem(str(self.fft_size))
+                self.fft_combo.setCurrentText(str(self.fft_size))
+                self.hop_spin.setValue(self.hop)
+                self.window_combo.setCurrentText(self.window_name)
+                self.smooth_slider.setValue(int(self.smooth_alpha * 99))
+                self.gain_slider.setValue(int(self.gain * 100))
+                self.dbfloor_slider.setValue(int(self.db_floor))
+                self.onset_thr_slider.setValue(int(self.onset_thr * 2))
+                self.colormap_combo.setCurrentText(self.colormap_name)
+                self._apply_colormap()
+                self.statusBar().showMessage(f"✓ Preset loaded: {fname}")
+                self._recalc_freqs()
+            except Exception as e:
+                self.statusBar().showMessage(f"✗ Load failed: {e}")
 
     def _recalc_freqs(self):
         self.freqs = np.fft.rfftfreq(self.fft_size, 1.0 / self.sr)
@@ -547,6 +574,10 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.onset_detector = OnsetDetector(thr=self.onset_thr)
 
     def _on_timer(self):
+        # ✓ PATCHED: Check is_closing flag
+        if self.is_closing:
+            return
+
         block = self.audio_source.read_block()
         if block is None:
             return
@@ -572,15 +603,19 @@ class VisualizerApp(QtWidgets.QMainWindow):
         self.spectrum_curve.setData(self.freqs, self.smooth_spec)
         self.plot_widget.setYRange(self.db_floor, DEFAULT_DB_CEILING)
 
-        peaks = detect_peaks(self.smooth_spec, self.freqs, top_n=self.peak_count)
+        peaks = detect_peaks(self.smooth_spec, self.freqs, top_n=max(1, min(self.peak_count, 20)))  # ✓ PATCHED: Bounds check
 
+        # ✓ PATCHED: Better exception handling for peak cleanup
         for it in self.peak_text_items:
-            self.plot_widget.removeItem(it)
+            try:
+                self.plot_widget.removeItem(it)
+            except Exception:
+                pass
         self.peak_text_items = []
 
         for (f, dbv, idx) in peaks:
             if f <= 0:
-                return
+                continue  # ✓ PATCHED: Use continue instead of return
             note, cents, _ = freq_to_note_name(f)
             txt = f"{f:.1f} Hz\n{note} {cents:+.1f}c"
             ti = pg.TextItem(txt, anchor=(0.5, 1.0), color='w')
@@ -589,20 +624,24 @@ class VisualizerApp(QtWidgets.QMainWindow):
             self.plot_widget.addItem(ti)
             self.peak_text_items.append(ti)
 
-        self.sgram = np.roll(self.sgram, -1, axis=1)
-        self.sgram[:, -1] = mag_db
-        self.img_view.setImage(self.sgram, autoLevels=False, autoRange=False)
+        # ✓ PATCHED: Check if FFT size is being changed
+        if not self.fft_changing:
+            self.sgram = np.roll(self.sgram, -1, axis=1)
+            self.sgram[:, -1] = mag_db
+            self.img_view.setImage(self.sgram, autoLevels=False, autoRange=False)
 
         if onset:
             self.plot_widget.setBackground('#400000')
             self.setWindowTitle("DFT Visualizer — ONSET!")
-            self.onset_flash_timer.start(120)  # Re-starts countdown seamlessly on rapid hits
+            self.onset_flash_timer.start(120)
 
     def _reset_onset_flash(self):
         self.plot_widget.setBackground('k')
-        self.setWindowTitle("DFT Visualizer — Full Edition")
+        self.setWindowTitle("DFT Visualizer — Full Edition (PATCHED)")
 
     def closeEvent(self, event):
+        # ✓ PATCHED: Set flag first, then stop timer
+        self.is_closing = True
         try:
             self.timer.stop()
             self.onset_flash_timer.stop()
@@ -623,7 +662,7 @@ class VisualizerApp(QtWidgets.QMainWindow):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DFT Audio Visualizer — Full Edition")
+    parser = argparse.ArgumentParser(description="DFT Audio Visualizer — Full Edition (PATCHED)")
     parser.add_argument('--mode', choices=['live', 'file'], required=True)
     parser.add_argument('--file', type=str, help='If mode=file, path to audio file')
     parser.add_argument('--sr', type=int, default=DEFAULT_SR)
